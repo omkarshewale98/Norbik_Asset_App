@@ -1,0 +1,30 @@
+import { DataSource } from 'typeorm';
+import { AuditActor } from '../phase2.types';
+import { RemoteJob } from '../interfaces/device.interface';
+import { AgentRepository } from '../store/agent.repository';
+import { CredentialService } from '../credentials/credential.service';
+import { JobsService } from '../jobs/jobs.service';
+import { DiscoveryService } from '../discovery.service';
+import { ScanSchedule, ScanScheduleInput, ScanScheduleRepository } from './scan-schedule.repository';
+export declare class ScanScheduleService {
+    private readonly dataSource;
+    private readonly repo;
+    private readonly agents;
+    private readonly credentials;
+    private readonly jobs;
+    private readonly discovery;
+    private readonly logger;
+    private readonly firedMinute;
+    constructor(dataSource: DataSource, repo: ScanScheduleRepository, agents: AgentRepository, credentials: CredentialService, jobs: JobsService, discovery: DiscoveryService);
+    private validate;
+    list(schema: string): Promise<ScanSchedule[]>;
+    create(schema: string, input: ScanScheduleInput, userId: number | null): Promise<ScanSchedule>;
+    update(schema: string, id: string, input: ScanScheduleInput): Promise<ScanSchedule>;
+    remove(schema: string, id: string): Promise<void>;
+    queue(schema: string, id: string, actor: AuditActor, reason: 'manual' | 'scheduled'): Promise<RemoteJob>;
+    private hasActiveJob;
+    private schemas;
+    tick(): Promise<void>;
+    onJobResult(schema: string, job: RemoteJob): Promise<void>;
+    onJobFailed(schema: string, job: RemoteJob): Promise<void>;
+}

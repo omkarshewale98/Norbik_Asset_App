@@ -1,0 +1,306 @@
+name: Deploy Billing Backend Production
+
+on:
+  push:
+    branches: [Asset_Production]
+    paths:
+      - "billing-backend/exported/**"
+      - ".github/workflows/deploy-billing-backend.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-billing-backend
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, Linux, X64, production]
+
+    env:
+      DEPLOY_ROOT: /opt/asset-production/billing-backend
+      PM2_APP_NAME: subscription-backend
+      HEALTH_URL: http://127.0.0.1:8012/
+      NODE_OPTIONS: --max-old-space-size=2048
+
+    steps:
+      - name: Check disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          AVAIL_KB=$(df --output=avail / | tail -1)
+
+          echo "Free space: $((AVAIL_KB / 1024)) MB"
+
+          if [ "$AVAIL_KB" -le 3145728 ]; then
+            echo "❌ Less than 3GB free on /"
+            exit 1
+          fi
+
+          echo "✅ Disk space is sufficient"
+
+      - name: Checkout production package
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            billing-backend/exported/**
+            !billing-backend/exported/node_modules/**
+            !billing-backend/exported/.env
+            !billing-backend/exported/keys/**
+            !billing-backend/exported/uploads/**
+            !billing-backend/exported/.next/cache/**
+
+      - name: Check Node and npm version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          node -v
+          npm -v
+
+          echo "Runner:"
+          hostname
+
+          echo "User:"
+          whoami
+
+      - name: Verify production package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -d billing-backend/exported
+          test -f billing-backend/exported/package.json
+          test -f billing-backend/exported/package-lock.json
+          test -d billing-backend/exported/dist
+
+          echo "✅ Billing Backend package verified"
+
+      - name: Prepare release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RELEASE_ID="${GITHUB_SHA}-${GITHUB_RUN_NUMBER}"
+          RELEASE_DIR="$DEPLOY_ROOT/releases/$RELEASE_ID"
+
+          mkdir -p "$DEPLOY_ROOT/releases"
+          mkdir -p "$DEPLOY_ROOT/shared/uploads"
+          mkdir -p "$DEPLOY_ROOT/shared/keys"
+          mkdir -p "$RELEASE_DIR"
+
+          echo "$RELEASE_ID" > "$RUNNER_TEMP/release-id"
+
+      - name: Copy production package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RELEASE_ID="$(cat "$RUNNER_TEMP/release-id")"
+          RELEASE_DIR="$DEPLOY_ROOT/releases/$RELEASE_ID"
+
+          rsync -a --delete \
+            --exclude='.env' \
+            --exclude='node_modules/' \
+            --exclude='uploads/' \
+            --exclude='keys/' \
+            --exclude='.next/cache/' \
+            billing-backend/exported/ "$RELEASE_DIR/"
+
+          echo "✅ Release copied"
+
+      - name: Verify production environment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "$DEPLOY_ROOT/shared/.env" ]; then
+            echo "❌ Production .env is missing:"
+            echo "$DEPLOY_ROOT/shared/.env"
+            exit 1
+          fi
+
+          echo "✅ Production .env exists"
+
+      - name: Configure release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RELEASE_ID="$(cat "$RUNNER_TEMP/release-id")"
+          RELEASE_DIR="$DEPLOY_ROOT/releases/$RELEASE_ID"
+
+          ln -sfn \
+            "$DEPLOY_ROOT/shared/.env" \
+            "$RELEASE_DIR/.env"
+
+          ln -sfn \
+            "$DEPLOY_ROOT/shared/uploads" \
+            "$RELEASE_DIR/uploads"
+
+          ln -sfn \
+            "$DEPLOY_ROOT/shared/keys" \
+            "$RELEASE_DIR/keys"
+
+          echo "✅ Shared files configured"
+
+      - name: Install production dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RELEASE_ID="$(cat "$RUNNER_TEMP/release-id")"
+          RELEASE_DIR="$DEPLOY_ROOT/releases/$RELEASE_ID"
+
+          cd "$RELEASE_DIR"
+
+          npm ci \
+            --omit=dev \
+            --no-audit \
+            --no-fund \
+            --fetch-retries=5 \
+            --fetch-retry-mintimeout=20000 \
+            --fetch-retry-maxtimeout=120000
+
+          echo "✅ Production dependencies installed"
+
+      - name: Activate release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RELEASE_ID="$(cat "$RUNNER_TEMP/release-id")"
+          RELEASE_DIR="$DEPLOY_ROOT/releases/$RELEASE_ID"
+
+          PREVIOUS="$(readlink -f "$DEPLOY_ROOT/current" 2>/dev/null || true)"
+
+          echo "$PREVIOUS" > "$RUNNER_TEMP/previous-release"
+
+          ln -sfn "$RELEASE_DIR" "$DEPLOY_ROOT/current.next"
+          mv -Tf "$DEPLOY_ROOT/current.next" "$DEPLOY_ROOT/current"
+
+          echo "Current release:"
+          readlink -f "$DEPLOY_ROOT/current"
+
+      - name: Restart Billing Backend
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$DEPLOY_ROOT/current"
+
+          if pm2 describe "$PM2_APP_NAME" >/dev/null 2>&1; then
+            pm2 restart "$PM2_APP_NAME" --update-env
+          else
+            pm2 start npm \
+              --name "$PM2_APP_NAME" \
+              --cwd "$DEPLOY_ROOT/current" \
+              -- start
+          fi
+
+          pm2 save
+
+          pm2 status
+
+      - name: Health check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MAX_ATTEMPTS=20
+          SLEEP_SECONDS=3
+
+          for i in $(seq 1 "$MAX_ATTEMPTS"); do
+
+            echo "Health check attempt $i/$MAX_ATTEMPTS"
+
+            HTTP_CODE=$(curl -s \
+              -o /tmp/billing-backend-health.txt \
+              -w "%{http_code}" \
+              --connect-timeout 5 \
+              --max-time 10 \
+              "$HEALTH_URL" || true)
+
+            echo "HTTP Status: $HTTP_CODE"
+
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "✅ Billing Backend is healthy"
+              exit 0
+            fi
+
+            sleep "$SLEEP_SECONDS"
+          done
+
+          echo "❌ Billing Backend health check failed"
+          exit 1
+
+      - name: Rollback on failure
+        if: failure()
+        shell: bash
+        run: |
+          set +e
+
+          PREVIOUS="$(cat "$RUNNER_TEMP/previous-release" 2>/dev/null || true)"
+
+          if [ -n "$PREVIOUS" ] && [ -d "$PREVIOUS" ]; then
+
+            ln -sfn "$PREVIOUS" "$DEPLOY_ROOT/current.rollback"
+            mv -Tf "$DEPLOY_ROOT/current.rollback" "$DEPLOY_ROOT/current"
+
+            pm2 delete "$PM2_APP_NAME" >/dev/null 2>&1 || true
+
+            pm2 start npm \
+              --name "$PM2_APP_NAME" \
+              --cwd "$DEPLOY_ROOT/current" \
+              -- start
+
+            pm2 save
+
+            echo "✅ Previous release restored"
+          fi
+
+          pm2 status || true
+          pm2 logs "$PM2_APP_NAME" --lines 100 --nostream || true
+
+      - name: Cleanup old releases
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CURRENT="$(readlink -f "$DEPLOY_ROOT/current" 2>/dev/null || true)"
+
+          find "$DEPLOY_ROOT/releases" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            -printf '%T@ %p\n' |
+            sort -nr |
+            tail -n +6 |
+            cut -d' ' -f2- |
+            while IFS= read -r OLD_RELEASE; do
+
+              if [ -n "$OLD_RELEASE" ] && [ "$OLD_RELEASE" != "$CURRENT" ]; then
+                echo "Removing old release: $OLD_RELEASE"
+                rm -rf -- "$OLD_RELEASE"
+              fi
+
+            done
+
+          echo "✅ Old releases cleaned"
+
+      - name: Deployment complete
+        if: success()
+        shell: bash
+        run: |
+          echo "======================================"
+          echo "✅ BILLING BACKEND DEPLOYMENT SUCCESSFUL"
+          echo "======================================"
+
+          readlink -f "$DEPLOY_ROOT/current"
+          pm2 status

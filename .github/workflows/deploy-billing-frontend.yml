@@ -1,0 +1,495 @@
+name: Deploy Billing Frontend Production
+
+on:
+  push:
+    branches:
+      - Asset_Production
+    paths:
+      - "billing-frontend/exported/**"
+      - ".github/workflows/deploy-billing-frontend.yml"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-billing-frontend
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, Linux, X64, production]
+
+    env:
+      DEPLOY_ROOT: /opt/asset-production/billing-frontend
+      PM2_APP_NAME: subscription-frontend
+      HEALTH_URL: http://127.0.0.1:3000/
+      NODE_OPTIONS: --max-old-space-size=2048
+
+    steps:
+      # ---------------------------------------------------------
+      # 1. Check disk space
+      # ---------------------------------------------------------
+      - name: Check disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "======================================"
+          echo "Checking production VM disk space"
+          echo "======================================"
+
+          AVAIL_KB=$(df --output=avail / | tail -1)
+
+          echo "Free space: $((AVAIL_KB / 1024)) MB"
+
+          if [ "$AVAIL_KB" -le 3145728 ]; then
+            echo "❌ Less than 3GB free on /"
+            exit 1
+          fi
+
+          echo "✅ Disk space is sufficient"
+
+      # ---------------------------------------------------------
+      # 2. Checkout only Billing Frontend production package
+      # ---------------------------------------------------------
+      - name: Checkout production package
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            billing-frontend/exported/**
+            !billing-frontend/exported/node_modules/**
+            !billing-frontend/exported/.env
+            !billing-frontend/exported/uploads/**
+            !billing-frontend/exported/.next/cache/**
+
+      # ---------------------------------------------------------
+      # 3. Verify Node / npm / runner
+      # ---------------------------------------------------------
+      - name: Check Node and npm version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "======================================"
+          echo "Node version"
+          echo "======================================"
+          node -v
+
+          echo "======================================"
+          echo "npm version"
+          echo "======================================"
+          npm -v
+
+          echo "======================================"
+          echo "Runner hostname"
+          echo "======================================"
+          hostname
+
+          echo "======================================"
+          echo "Runner user"
+          echo "======================================"
+          whoami
+
+      # ---------------------------------------------------------
+      # 4. Verify production package
+      # ---------------------------------------------------------
+      - name: Verify production package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "======================================"
+          echo "Verifying Billing Frontend package"
+          echo "======================================"
+
+          test -d billing-frontend/exported
+          test -f billing-frontend/exported/package.json
+          test -f billing-frontend/exported/package-lock.json
+          test -d billing-frontend/exported/.next
+
+          echo "✅ Billing Frontend production package verified"
+
+      # ---------------------------------------------------------
+      # 5. Prepare release directory
+      # ---------------------------------------------------------
+      - name: Prepare release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RELEASE_ID="${GITHUB_SHA}-${GITHUB_RUN_NUMBER}"
+          RELEASE_DIR="$DEPLOY_ROOT/releases/$RELEASE_ID"
+
+          echo "======================================"
+          echo "Preparing release"
+          echo "======================================"
+
+          echo "Release ID:"
+          echo "$RELEASE_ID"
+
+          echo "Release directory:"
+          echo "$RELEASE_DIR"
+
+          mkdir -p "$DEPLOY_ROOT/releases"
+          mkdir -p "$DEPLOY_ROOT/shared"
+          mkdir -p "$RELEASE_DIR"
+
+          echo "$RELEASE_ID" > "$RUNNER_TEMP/release-id"
+
+          echo "✅ Release directory prepared"
+
+      # ---------------------------------------------------------
+      # 6. Copy production package to release
+      # ---------------------------------------------------------
+      - name: Copy production package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RELEASE_ID="$(cat "$RUNNER_TEMP/release-id")"
+          RELEASE_DIR="$DEPLOY_ROOT/releases/$RELEASE_ID"
+
+          echo "======================================"
+          echo "Copying Billing Frontend package"
+          echo "======================================"
+
+          rsync -a --delete \
+            --exclude='.env' \
+            --exclude='node_modules/' \
+            --exclude='uploads/' \
+            --exclude='.next/cache/' \
+            billing-frontend/exported/ "$RELEASE_DIR/"
+
+          echo "✅ Production package copied"
+
+      # ---------------------------------------------------------
+      # 7. Verify server-managed production environment
+      # ---------------------------------------------------------
+      - name: Verify production environment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "======================================"
+          echo "Checking production environment"
+          echo "======================================"
+
+          if [ ! -f "$DEPLOY_ROOT/shared/.env" ]; then
+            echo "❌ Production environment file is missing:"
+            echo "$DEPLOY_ROOT/shared/.env"
+            echo ""
+            echo "Create the Billing Frontend production .env"
+            echo "on the production VM before deployment."
+            exit 1
+          fi
+
+          echo "✅ Production .env exists"
+
+      # ---------------------------------------------------------
+      # 8. Configure release
+      # ---------------------------------------------------------
+      - name: Configure release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RELEASE_ID="$(cat "$RUNNER_TEMP/release-id")"
+          RELEASE_DIR="$DEPLOY_ROOT/releases/$RELEASE_ID"
+
+          echo "======================================"
+          echo "Configuring release"
+          echo "======================================"
+
+          ln -sfn \
+            "$DEPLOY_ROOT/shared/.env" \
+            "$RELEASE_DIR/.env"
+
+          echo "Shared .env linked"
+
+          echo "✅ Release configured"
+
+      # ---------------------------------------------------------
+      # 9. Install production dependencies
+      # ---------------------------------------------------------
+      - name: Install production dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RELEASE_ID="$(cat "$RUNNER_TEMP/release-id")"
+          RELEASE_DIR="$DEPLOY_ROOT/releases/$RELEASE_ID"
+
+          cd "$RELEASE_DIR"
+
+          echo "======================================"
+          echo "Installing production dependencies"
+          echo "======================================"
+
+          npm ci \
+            --omit=dev \
+            --no-audit \
+            --no-fund \
+            --fetch-retries=5 \
+            --fetch-retry-mintimeout=20000 \
+            --fetch-retry-maxtimeout=120000
+
+          echo "✅ Production dependencies installed"
+
+      # ---------------------------------------------------------
+      # 10. Activate release
+      # ---------------------------------------------------------
+      - name: Activate release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RELEASE_ID="$(cat "$RUNNER_TEMP/release-id")"
+          RELEASE_DIR="$DEPLOY_ROOT/releases/$RELEASE_ID"
+
+          echo "======================================"
+          echo "Activating release"
+          echo "======================================"
+
+          PREVIOUS="$(readlink -f "$DEPLOY_ROOT/current" 2>/dev/null || true)"
+
+          echo "$PREVIOUS" > "$RUNNER_TEMP/previous-release"
+
+          ln -sfn \
+            "$RELEASE_DIR" \
+            "$DEPLOY_ROOT/current.next"
+
+          mv -Tf \
+            "$DEPLOY_ROOT/current.next" \
+            "$DEPLOY_ROOT/current"
+
+          echo "Current release:"
+          readlink -f "$DEPLOY_ROOT/current"
+
+          echo "Previous release:"
+          echo "${PREVIOUS:-None}"
+
+          echo "✅ Release activated"
+
+      # ---------------------------------------------------------
+      # 11. Restart Billing Frontend with PM2
+      # ---------------------------------------------------------
+      - name: Restart Billing Frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$DEPLOY_ROOT/current"
+
+          echo "======================================"
+          echo "Restarting Billing Frontend"
+          echo "======================================"
+
+          if pm2 describe "$PM2_APP_NAME" >/dev/null 2>&1; then
+
+            echo "Existing PM2 application found."
+            echo "Restarting $PM2_APP_NAME..."
+
+            pm2 restart "$PM2_APP_NAME" --update-env
+
+          else
+
+            echo "PM2 application does not exist."
+            echo "Starting $PM2_APP_NAME..."
+
+            pm2 start npm \
+              --name "$PM2_APP_NAME" \
+              --cwd "$DEPLOY_ROOT/current" \
+              -- start
+
+          fi
+
+          pm2 save
+
+          echo ""
+          echo "======================================"
+          echo "PM2 STATUS"
+          echo "======================================"
+
+          pm2 status
+
+      # ---------------------------------------------------------
+      # 12. Health check
+      # ---------------------------------------------------------
+      - name: Health check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MAX_ATTEMPTS=20
+          SLEEP_SECONDS=3
+
+          echo "======================================"
+          echo "Billing Frontend health check"
+          echo "======================================"
+
+          for i in $(seq 1 "$MAX_ATTEMPTS"); do
+
+            echo "Health check attempt $i/$MAX_ATTEMPTS"
+
+            HTTP_CODE=$(curl -s \
+              -o /tmp/billing-frontend-health.txt \
+              -w "%{http_code}" \
+              --connect-timeout 5 \
+              --max-time 10 \
+              "$HEALTH_URL" || true)
+
+            echo "HTTP Status: $HTTP_CODE"
+
+            if [ "$HTTP_CODE" = "200" ]; then
+
+              echo "✅ Billing Frontend is healthy"
+
+              cat /tmp/billing-frontend-health.txt || true
+
+              exit 0
+            fi
+
+            sleep "$SLEEP_SECONDS"
+
+          done
+
+          echo "❌ Billing Frontend health check failed"
+
+          echo ""
+          echo "========== PM2 STATUS =========="
+          pm2 status || true
+
+          echo ""
+          echo "========== PM2 LOGS =========="
+          pm2 logs "$PM2_APP_NAME" --lines 100 --nostream || true
+
+          exit 1
+
+      # ---------------------------------------------------------
+      # 13. Rollback if deployment fails
+      # ---------------------------------------------------------
+      - name: Rollback on failure
+        if: failure()
+        shell: bash
+        run: |
+          set +e
+
+          PREVIOUS="$(cat "$RUNNER_TEMP/previous-release" 2>/dev/null || true)"
+
+          echo "======================================"
+          echo "Deployment failed"
+          echo "Attempting rollback"
+          echo "======================================"
+
+          if [ -n "$PREVIOUS" ] && [ -d "$PREVIOUS" ]; then
+
+            echo "Restoring previous release:"
+            echo "$PREVIOUS"
+
+            ln -sfn \
+              "$PREVIOUS" \
+              "$DEPLOY_ROOT/current.rollback"
+
+            mv -Tf \
+              "$DEPLOY_ROOT/current.rollback" \
+              "$DEPLOY_ROOT/current"
+
+            pm2 delete "$PM2_APP_NAME" >/dev/null 2>&1 || true
+
+            pm2 start npm \
+              --name "$PM2_APP_NAME" \
+              --cwd "$DEPLOY_ROOT/current" \
+              -- start
+
+            pm2 save
+
+            echo "✅ Previous release restored"
+
+          else
+
+            echo "⚠️ No previous release available for rollback"
+
+            pm2 delete "$PM2_APP_NAME" >/dev/null 2>&1 || true
+
+          fi
+
+          echo ""
+          echo "========== PM2 STATUS =========="
+          pm2 status || true
+
+          echo ""
+          echo "========== PM2 LOGS =========="
+          pm2 logs "$PM2_APP_NAME" --lines 100 --nostream || true
+
+      # ---------------------------------------------------------
+      # 14. Cleanup old releases
+      # ---------------------------------------------------------
+      - name: Cleanup old releases
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CURRENT="$(readlink -f "$DEPLOY_ROOT/current" 2>/dev/null || true)"
+
+          echo "======================================"
+          echo "Cleaning old releases"
+          echo "======================================"
+
+          find "$DEPLOY_ROOT/releases" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            -printf '%T@ %p\n' |
+            sort -nr |
+            tail -n +6 |
+            cut -d' ' -f2- |
+            while IFS= read -r OLD_RELEASE; do
+
+              if [ -n "$OLD_RELEASE" ] && [ "$OLD_RELEASE" != "$CURRENT" ]; then
+
+                echo "Removing old release:"
+                echo "$OLD_RELEASE"
+
+                rm -rf -- "$OLD_RELEASE"
+
+              fi
+
+            done
+
+          echo "✅ Old releases cleaned"
+
+      # ---------------------------------------------------------
+      # 15. Deployment complete
+      # ---------------------------------------------------------
+      - name: Deployment complete
+        if: success()
+        shell: bash
+        run: |
+          echo "======================================"
+          echo "✅ BILLING FRONTEND DEPLOYMENT SUCCESSFUL"
+          echo "======================================"
+
+          echo ""
+          echo "Application:"
+          echo "Billing Frontend"
+
+          echo ""
+          echo "PM2 application:"
+          echo "$PM2_APP_NAME"
+
+          echo ""
+          echo "Current release:"
+          readlink -f "$DEPLOY_ROOT/current"
+
+          echo ""
+          echo "Health URL:"
+          echo "$HEALTH_URL"
+
+          echo ""
+          echo "========== PM2 STATUS =========="
+          pm2 status
